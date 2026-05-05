@@ -42,34 +42,62 @@ UPDATE_REPO_URL = "https://github.com/CrissZollo/ZendeskTicket"
 UPDATE_BRANCH = "main"
 UPDATE_TIMEOUT_SECONDS = 10
 UPDATE_SKIP_DIRS = {"data"}
-UPDATE_TOGGLE_FILE = "auto-update.txt"
-UPDATE_SKIP_FILES = {UPDATE_TOGGLE_FILE}
+AUTO_UPDATE_DISABLED_FILE = "auto_update_disabled.txt"
+LAST_DATA_DIR_FILE = "last-data-dir.txt"
+UPDATE_SKIP_FILES = {AUTO_UPDATE_DISABLED_FILE, LAST_DATA_DIR_FILE}
 
 
 def auto_update_enabled(install_dir: Path) -> bool:
-    """Read auto-update.txt next to the script. 'yes' = on, 'no' = off.
-
-    The file is created on first run (default 'yes'). Anything other than
-    a clear 'no' is treated as enabled, so a typo doesn't silently disable
-    updates.
+    """Auto-update is on by default. Drop a file named
+    auto_update_disabled.txt next to the script to turn it off.
     """
-    toggle = install_dir / UPDATE_TOGGLE_FILE
-    if not toggle.exists():
-        try:
-            toggle.write_text(
-                "yes\n"
-                "# Set to 'yes' to fetch updates from GitHub on startup,\n"
-                "# or 'no' to keep the local version. One word on the first line.\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-        return True
+    return not (install_dir / AUTO_UPDATE_DISABLED_FILE).exists()
+
+
+def read_last_data_dir(install_dir: Path) -> Path | None:
+    """Return the data folder remembered from a previous run, or None.
+
+    The file holds the absolute path on its first non-comment line. Returns
+    None when the file is missing, unreadable, empty, or points at a path
+    that no longer exists or isn't a directory — callers fall through to
+    the default in that case.
+    """
+    saved = install_dir / LAST_DATA_DIR_FILE
+    if not saved.exists():
+        return None
     try:
-        first_line = toggle.read_text(encoding="utf-8").splitlines()[0].strip().lower()
-    except (OSError, IndexError):
-        return True
-    return first_line != "no"
+        lines = saved.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        try:
+            p = Path(s).expanduser().resolve()
+        except (OSError, RuntimeError):
+            return None
+        return p if p.is_dir() else None
+    return None
+
+
+def write_last_data_dir(install_dir: Path, data_dir: Path) -> None:
+    """Persist the most recently chosen data folder next to the script.
+
+    Failures are swallowed: an inability to write this file must never
+    break the user-facing setup flow.
+    """
+    saved = install_dir / LAST_DATA_DIR_FILE
+    try:
+        saved.write_text(
+            f"{data_dir}\n"
+            "# The data folder picked via the web setup page.\n"
+            "# Used automatically on next startup unless --data-dir is passed.\n"
+            "# Delete this file to forget the saved location.\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 # --- self-update -----------------------------------------------------------
@@ -251,19 +279,26 @@ class Backend:
             clauses.append("t.id IN (SELECT ticket_id FROM ticket_tags WHERE tag = ?)")
             sql_params.append(params["tag"].lower())
 
-        for field, alias, search_cols in (
-            ("requester", "r", ("name", "email")),
-            ("assignee", "a", ("name", "email")),
-            ("organization", "o", ("name", "domain_names_json")),
-            ("group", "g", ("name",)),
+        for field, sql_col, table, search_cols in (
+            ("requester", "requester_id", "users", ("name", "email")),
+            ("assignee", "assignee_id", "users", ("name", "email")),
+            ("organization", "organization_id", "organizations", ("name", "domain_names_json")),
+            ("group", "group_id", "groups_", ("name",)),
         ):
             needle = (params.get(field) or "").strip()
             if not needle:
                 continue
             like = f"%{needle.lower()}%"
-            cond = " OR ".join(f"LOWER({alias}.{c}) LIKE ?" for c in search_cols)
-            clauses.append("(" + cond + ")")
-            sql_params.extend([like] * len(search_cols))
+            cond = " OR ".join(f"LOWER({c}) LIKE ?" for c in search_cols)
+            with self._lock:
+                ids = [r[0] for r in self.con.execute(
+                    f"SELECT id FROM {table} WHERE {cond}",
+                    [like] * len(search_cols),
+                ).fetchall()]
+            if not ids:
+                return [], 0
+            clauses.append(f"t.{sql_col} IN ({','.join('?' * len(ids))})")
+            sql_params.extend(ids)
 
         for date_field, op in (
             ("created_after", ">="), ("created_before", "<="),
@@ -280,33 +315,39 @@ class Backend:
             clauses.append(f"t.{col} {op} ?")
             sql_params.append(ts)
 
-        # LEFT JOINs on indexed PKs are essentially free and let us resolve
-        # requester/assignee/org names in the same query (no per-row N+1)
-        # and also let people/org/group filters be plain WHERE predicates.
-        joins = (
-            " LEFT JOIN users r         ON r.id = t.requester_id"
-            " LEFT JOIN users a         ON a.id = t.assignee_id"
-            " LEFT JOIN organizations o ON o.id = t.organization_id"
-            " LEFT JOIN groups_ g       ON g.id = t.group_id"
-        )
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        cnt_sql = "SELECT COUNT(*) FROM tickets t" + joins + where
+        cnt_sql = "SELECT COUNT(*) FROM tickets t" + where
+
+        sort_cols = {
+            "id":       "t.id",
+            "status":   "t.status",
+            "priority": "t.priority",
+            "updated":  "t.updated_ts",
+            "subject":  "t.subject COLLATE NOCASE",
+        }
+        sort_expr = sort_cols.get(params.get("sort") or "updated", sort_cols["updated"])
+        order_dir = "ASC" if str(params.get("order") or "desc").lower() == "asc" else "DESC"
+
         sel_sql = (
             "SELECT t.id, t.subject, t.status, t.priority, t.type, t.created_at, t.updated_at, "
-            "       t.requester_id, t.assignee_id, t.organization_id, t.group_id, t.tags_json, "
-            "       COALESCE(NULLIF(r.name,''), r.email, '') AS requester_name, "
-            "       COALESCE(r.email, '')                    AS requester_email, "
-            "       COALESCE(NULLIF(a.name,''), a.email, '') AS assignee_name, "
-            "       COALESCE(o.name, '')                     AS organization_name "
-            "FROM tickets t" + joins + where +
-            " ORDER BY t.updated_ts DESC LIMIT ? OFFSET ?"
+            "       t.requester_id, t.assignee_id, t.organization_id, t.group_id, t.tags_json "
+            "FROM tickets t" + where +
+            f" ORDER BY {sort_expr} {order_dir}, t.id DESC LIMIT ? OFFSET ?"
         )
 
         with self._lock:
             total = self.con.execute(cnt_sql, sql_params).fetchone()[0]
             rows = [dict(r) for r in self.con.execute(sel_sql, sql_params + [limit, offset]).fetchall()]
 
+        # Enrich rows with names so the UI can render without N round-trips
         for r in rows:
+            u = self.lookup_user(r["requester_id"]) or {}
+            r["requester_name"] = u.get("name") or u.get("email") or ""
+            r["requester_email"] = u.get("email") or ""
+            a = self.lookup_user(r["assignee_id"]) or {}
+            r["assignee_name"] = a.get("name") or a.get("email") or ""
+            o = self.lookup_org(r["organization_id"]) or {}
+            r["organization_name"] = o.get("name") or ""
             try:
                 r["tags"] = json.loads(r.pop("tags_json") or "[]")
             except json.JSONDecodeError:
@@ -332,14 +373,16 @@ class Backend:
 
         with self._lock:
             comments = [dict(r) for r in self.con.execute(
-                "SELECT c.id, c.ticket_id, c.author_id, c.public, c.created_at, c.body, "
-                "       COALESCE(u.name, '')  AS author_name, "
-                "       COALESCE(u.email, '') AS author_email "
-                "FROM comments c "
-                "LEFT JOIN users u ON u.id = c.author_id "
-                "WHERE c.ticket_id=? ORDER BY c.created_ts, c.id",
+                "SELECT id, ticket_id, author_id, public, created_at, body "
+                "FROM comments WHERE ticket_id=? ORDER BY created_ts, id",
                 (tid,),
             ).fetchall()]
+
+        # Resolve author names
+        for c in comments:
+            au = self.lookup_user(c["author_id"]) or {}
+            c["author_name"] = au.get("name") or ""
+            c["author_email"] = au.get("email") or ""
 
         t["comments"] = comments
         t["requester"] = self.lookup_user(t.get("requester_id"))
@@ -619,6 +662,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         old_backend.close()
                     except Exception:
                         pass
+                write_last_data_dir(THIS_DIR, picked)
                 print(f"[zdweb] setup complete — using {picked}", flush=True)
                 return self._json(200, {"ok": True, "data_dir": str(picked)})
             except Exception as e:
@@ -965,7 +1009,12 @@ main > * { min-height:0; min-width:0; }
 #table-wrap { flex:1; min-height:0; overflow:auto; }
 table { border-collapse:collapse; width:100%; font-size:12px; }
 th { position:sticky; top:0; background:var(--bg); border-bottom:1px solid var(--border); text-align:left;
-  padding:6px 8px; font-weight:600; color:var(--sub); cursor:default; user-select:none; z-index:1; }
+  padding:6px 8px; font-weight:600; color:var(--sub); cursor:default; user-select:none; z-index:1;
+  white-space:nowrap; }
+th.sortable { cursor:pointer; }
+th.sortable:hover { color:var(--fg); }
+th.sortable.active { color:var(--fg); }
+.sort-ind { display:inline; margin-left:4px; opacity:0.7; pointer-events:none; }
 td { padding:5px 8px; border-bottom:1px solid var(--border); white-space:nowrap; overflow:hidden;
   text-overflow:ellipsis; max-width:300px; }
 tr.row { cursor:pointer; }
@@ -1058,8 +1107,12 @@ mark { background: rgba(245,158,11,0.4); color:inherit; padding:0 2px; border-ra
       <table>
         <thead>
           <tr>
-            <th class="id">#</th><th>Status</th><th>Pri</th><th>Updated</th>
-            <th>Requester</th><th>Assignee</th><th>Org</th><th>Subject</th>
+            <th class="id sortable" data-sort="id">#<span class="sort-ind"></span></th>
+            <th class="sortable" data-sort="status">Status<span class="sort-ind"></span></th>
+            <th class="sortable" data-sort="priority">Pri<span class="sort-ind"></span></th>
+            <th class="sortable" data-sort="updated">Updated<span class="sort-ind"></span></th>
+            <th>Requester</th><th>Assignee</th><th>Org</th>
+            <th class="sortable" data-sort="subject">Subject<span class="sort-ind"></span></th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -1080,6 +1133,8 @@ const state = {
   total: 0,
   selected: null,
   highlight: [],
+  sort: "updated",
+  order: "desc",
 };
 
 function debounce(fn, ms) {
@@ -1129,7 +1184,18 @@ function buildSearchParams() {
     if (v) p.set(id.replace("-","_"), v);
   }
   p.set("limit", "300");
+  p.set("sort", state.sort);
+  p.set("order", state.order);
   return p;
+}
+
+function updateSortIndicators() {
+  for (const th of document.querySelectorAll("th.sortable")) {
+    const active = th.dataset.sort === state.sort;
+    th.classList.toggle("active", active);
+    const ind = th.querySelector(".sort-ind");
+    if (ind) ind.textContent = active ? (state.order === "asc" ? "▲" : "▼") : "";
+  }
 }
 
 async function runSearch() {
@@ -1151,6 +1217,7 @@ async function runSearch() {
   state.rows = j.rows;
   state.total = j.total;
   renderRows();
+  updateSortIndicators();
   if (state.total === 0) {
     $("#status").textContent = "0 matches.";
     state.selected = null;
@@ -1358,6 +1425,20 @@ $("#clear-filters").addEventListener("click", () => {
   runSearch();
 });
 
+for (const th of document.querySelectorAll("th.sortable")) {
+  th.addEventListener("click", () => {
+    const key = th.dataset.sort;
+    if (state.sort === key) {
+      state.order = state.order === "asc" ? "desc" : "asc";
+    } else {
+      state.sort = key;
+      state.order = (key === "subject" || key === "status" || key === "priority") ? "asc" : "desc";
+    }
+    runSearch();
+  });
+}
+updateSortIndicators();
+
 // Keyboard
 document.addEventListener("keydown", (e) => {
   const tag = (e.target && e.target.tagName) || "";
@@ -1450,8 +1531,9 @@ def _build_index_if_missing(data_dir: Path, db_path: Path) -> None:
 
 def parse_args(argv):
     p = argparse.ArgumentParser(prog="zdweb", description="Local web UI for the Zendesk archive.")
-    p.add_argument("--data-dir", default=str(DEFAULT_DATA),
-                   help=f"path to the data directory (default {DEFAULT_DATA})")
+    p.add_argument("--data-dir", default=None,
+                   help=(f"path to the data directory (default: last folder "
+                         f"picked via the setup page, otherwise {DEFAULT_DATA})"))
     p.add_argument("--db", default=None,
                    help="path to zdsearch.sqlite (default <data-dir>/zdsearch.sqlite)")
     p.add_argument("--port", type=int, default=8765, help="local port (default 8765)")
@@ -1470,7 +1552,7 @@ def main(argv=None) -> int:
 
     if not args.no_update and not os.environ.get("ZDWEB_UPDATED"):
         if not auto_update_enabled(THIS_DIR):
-            print(f"[zdweb] auto-update disabled via {UPDATE_TOGGLE_FILE}", flush=True)
+            print(f"[zdweb] auto-update disabled via {AUTO_UPDATE_DISABLED_FILE}", flush=True)
         else:
             changed = self_update(THIS_DIR)
             if changed > 0:
@@ -1479,7 +1561,16 @@ def main(argv=None) -> int:
                 result = subprocess.run([sys.executable, sys.argv[0], *argv], env=env)
                 return result.returncode
 
-    data_dir = Path(args.data_dir).expanduser().resolve()
+    if args.data_dir is not None:
+        data_dir = Path(args.data_dir).expanduser().resolve()
+        print(f"[zdweb] data folder from --data-dir: {data_dir}", flush=True)
+    else:
+        remembered = read_last_data_dir(THIS_DIR)
+        if remembered is not None:
+            data_dir = remembered
+            print(f"[zdweb] data folder from {LAST_DATA_DIR_FILE}: {data_dir}", flush=True)
+        else:
+            data_dir = DEFAULT_DATA
     db_path = Path(args.db).expanduser().resolve() if args.db else None
 
     state = AppState(data_dir=data_dir, db_path=db_path)

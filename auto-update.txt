@@ -1,3 +1,0 @@
-yes
-# Set to 'yes' to fetch updates from GitHub on startup,
-# or 'no' to keep the local version. One word on the first line.
