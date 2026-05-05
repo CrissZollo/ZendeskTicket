@@ -22,6 +22,7 @@ import shutil
 import socket
 import socketserver
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -102,6 +103,31 @@ def write_last_data_dir(install_dir: Path, data_dir: Path) -> None:
 
 # --- self-update -----------------------------------------------------------
 
+def _build_ssl_context() -> ssl.SSLContext:
+    """SSL context that also trusts the Windows ROOT cert store.
+
+    Vanilla python.org installs on Windows ship without any CA bundle and
+    rely on the user running 'Install Certificates.command' (which fetches
+    certifi). Many users don't, which makes the default context unable to
+    verify github.com. ssl.enum_certificates is stdlib-only and reads from
+    the live Windows trust store, so this works without bundling certifi.
+    """
+    ctx = ssl.create_default_context()
+    if sys.platform == "win32":
+        try:
+            for cert, encoding, trust in ssl.enum_certificates("ROOT"):
+                if encoding != "x509_asn":
+                    continue
+                if trust is True or (isinstance(trust, set) and "1.3.6.1.5.5.7.3.1" in trust):
+                    try:
+                        ctx.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(cert))
+                    except ssl.SSLError:
+                        pass
+        except (OSError, AttributeError):
+            pass
+    return ctx
+
+
 def self_update(install_dir: Path) -> int:
     """Fetch the latest version from GitHub and overwrite changed files.
 
@@ -116,7 +142,8 @@ def self_update(install_dir: Path) -> int:
             tmp_path = Path(tmp)
             zip_path = tmp_path / "update.zip"
             req = urllib.request.Request(zip_url, headers={"User-Agent": "zdweb-updater"})
-            with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT_SECONDS) as resp:
+            with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT_SECONDS,
+                                        context=_build_ssl_context()) as resp:
                 with open(zip_path, "wb") as f:
                     shutil.copyfileobj(resp, f)
 
@@ -148,7 +175,26 @@ def self_update(install_dir: Path) -> int:
                 changed += 1
             return changed
     except (urllib.error.URLError, socket.timeout, OSError, zipfile.BadZipFile) as e:
-        print(f"[zdweb] update check failed (continuing with local version): {e}", flush=True)
+        msg = str(e)
+        if "CERTIFICATE_VERIFY_FAILED" in msg or "SSL" in msg:
+            disabled = install_dir / AUTO_UPDATE_DISABLED_FILE
+            try:
+                disabled.write_text(
+                    "# Auto-created after a TLS verification failure during the update check.\n"
+                    "# This is common on managed Windows machines (corporate SSL inspection,\n"
+                    "# antivirus, missing root certs). Delete this file to re-enable updates.\n",
+                    encoding="utf-8",
+                )
+                print(f"[zdweb] update check failed (TLS verification). "
+                      f"Auto-update has been disabled — delete {AUTO_UPDATE_DISABLED_FILE} "
+                      f"to retry on the next run.",
+                      flush=True)
+            except OSError:
+                print(f"[zdweb] skipping update check (TLS verification failed). "
+                      f"Create {AUTO_UPDATE_DISABLED_FILE} next to the script to silence this.",
+                      flush=True)
+        else:
+            print(f"[zdweb] update check failed (continuing with local version): {e}", flush=True)
         return 0
 
 
@@ -550,7 +596,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # status endpoint work until a backend is configured.
             if not self.state.is_ready():
                 if path == "/setup":
-                    return self._html(_render_setup_html(str(self.state.data_dir)))
+                    return self._html(_render_setup_html(_setup_default_path(self.state.data_dir)))
                 if path == "/api/setup/status":
                     return self._json(200, {
                         "ready": False,
@@ -567,7 +613,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             if path == "/setup":
                 # Configured already, but the user may want to switch folders.
-                return self._html(_render_setup_html(str(self.state.data_dir)))
+                return self._html(_render_setup_html(_setup_default_path(self.state.data_dir)))
             if path == "/api/setup/status":
                 return self._json(200, {"ready": True, "data_dir": str(self.state.data_dir)})
             if path == "/api/fs/list":
@@ -701,6 +747,15 @@ def _fs_roots() -> dict:
             if p.is_dir():
                 roots.append({"name": extra, "path": extra})
     return {"roots": roots, "home": str(home), "sep": os.sep}
+
+
+def _setup_default_path(data_dir: Path) -> str:
+    try:
+        if data_dir.is_dir():
+            return str(data_dir)
+    except OSError:
+        pass
+    return str(Path.home())
 
 
 def _render_setup_html(default_path: str) -> str:
