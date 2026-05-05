@@ -42,6 +42,34 @@ UPDATE_REPO_URL = "https://github.com/CrissZollo/ZendeskTicket"
 UPDATE_BRANCH = "main"
 UPDATE_TIMEOUT_SECONDS = 10
 UPDATE_SKIP_DIRS = {"data"}
+UPDATE_TOGGLE_FILE = "auto-update.txt"
+UPDATE_SKIP_FILES = {UPDATE_TOGGLE_FILE}
+
+
+def auto_update_enabled(install_dir: Path) -> bool:
+    """Read auto-update.txt next to the script. 'yes' = on, 'no' = off.
+
+    The file is created on first run (default 'yes'). Anything other than
+    a clear 'no' is treated as enabled, so a typo doesn't silently disable
+    updates.
+    """
+    toggle = install_dir / UPDATE_TOGGLE_FILE
+    if not toggle.exists():
+        try:
+            toggle.write_text(
+                "yes\n"
+                "# Set to 'yes' to fetch updates from GitHub on startup,\n"
+                "# or 'no' to keep the local version. One word on the first line.\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return True
+    try:
+        first_line = toggle.read_text(encoding="utf-8").splitlines()[0].strip().lower()
+    except (OSError, IndexError):
+        return True
+    return first_line != "no"
 
 
 # --- self-update -----------------------------------------------------------
@@ -81,6 +109,8 @@ def self_update(install_dir: Path) -> int:
                     continue
                 rel = src_file.relative_to(src_root)
                 if rel.parts and rel.parts[0] in UPDATE_SKIP_DIRS:
+                    continue
+                if rel.name in UPDATE_SKIP_FILES:
                     continue
                 dst_file = install_dir / rel
                 if dst_file.exists() and _files_equal(src_file, dst_file):
@@ -221,26 +251,19 @@ class Backend:
             clauses.append("t.id IN (SELECT ticket_id FROM ticket_tags WHERE tag = ?)")
             sql_params.append(params["tag"].lower())
 
-        for field, sql_col, table, search_cols in (
-            ("requester", "requester_id", "users", ("name", "email")),
-            ("assignee", "assignee_id", "users", ("name", "email")),
-            ("organization", "organization_id", "organizations", ("name", "domain_names_json")),
-            ("group", "group_id", "groups_", ("name",)),
+        for field, alias, search_cols in (
+            ("requester", "r", ("name", "email")),
+            ("assignee", "a", ("name", "email")),
+            ("organization", "o", ("name", "domain_names_json")),
+            ("group", "g", ("name",)),
         ):
             needle = (params.get(field) or "").strip()
             if not needle:
                 continue
             like = f"%{needle.lower()}%"
-            cond = " OR ".join(f"LOWER({c}) LIKE ?" for c in search_cols)
-            with self._lock:
-                ids = [r[0] for r in self.con.execute(
-                    f"SELECT id FROM {table} WHERE {cond}",
-                    [like] * len(search_cols),
-                ).fetchall()]
-            if not ids:
-                return [], 0
-            clauses.append(f"t.{sql_col} IN ({','.join('?' * len(ids))})")
-            sql_params.extend(ids)
+            cond = " OR ".join(f"LOWER({alias}.{c}) LIKE ?" for c in search_cols)
+            clauses.append("(" + cond + ")")
+            sql_params.extend([like] * len(search_cols))
 
         for date_field, op in (
             ("created_after", ">="), ("created_before", "<="),
@@ -257,12 +280,25 @@ class Backend:
             clauses.append(f"t.{col} {op} ?")
             sql_params.append(ts)
 
+        # LEFT JOINs on indexed PKs are essentially free and let us resolve
+        # requester/assignee/org names in the same query (no per-row N+1)
+        # and also let people/org/group filters be plain WHERE predicates.
+        joins = (
+            " LEFT JOIN users r         ON r.id = t.requester_id"
+            " LEFT JOIN users a         ON a.id = t.assignee_id"
+            " LEFT JOIN organizations o ON o.id = t.organization_id"
+            " LEFT JOIN groups_ g       ON g.id = t.group_id"
+        )
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        cnt_sql = "SELECT COUNT(*) FROM tickets t" + where
+        cnt_sql = "SELECT COUNT(*) FROM tickets t" + joins + where
         sel_sql = (
             "SELECT t.id, t.subject, t.status, t.priority, t.type, t.created_at, t.updated_at, "
-            "       t.requester_id, t.assignee_id, t.organization_id, t.group_id, t.tags_json "
-            "FROM tickets t" + where +
+            "       t.requester_id, t.assignee_id, t.organization_id, t.group_id, t.tags_json, "
+            "       COALESCE(NULLIF(r.name,''), r.email, '') AS requester_name, "
+            "       COALESCE(r.email, '')                    AS requester_email, "
+            "       COALESCE(NULLIF(a.name,''), a.email, '') AS assignee_name, "
+            "       COALESCE(o.name, '')                     AS organization_name "
+            "FROM tickets t" + joins + where +
             " ORDER BY t.updated_ts DESC LIMIT ? OFFSET ?"
         )
 
@@ -270,15 +306,7 @@ class Backend:
             total = self.con.execute(cnt_sql, sql_params).fetchone()[0]
             rows = [dict(r) for r in self.con.execute(sel_sql, sql_params + [limit, offset]).fetchall()]
 
-        # Enrich rows with names so the UI can render without N round-trips
         for r in rows:
-            u = self.lookup_user(r["requester_id"]) or {}
-            r["requester_name"] = u.get("name") or u.get("email") or ""
-            r["requester_email"] = u.get("email") or ""
-            a = self.lookup_user(r["assignee_id"]) or {}
-            r["assignee_name"] = a.get("name") or a.get("email") or ""
-            o = self.lookup_org(r["organization_id"]) or {}
-            r["organization_name"] = o.get("name") or ""
             try:
                 r["tags"] = json.loads(r.pop("tags_json") or "[]")
             except json.JSONDecodeError:
@@ -304,16 +332,14 @@ class Backend:
 
         with self._lock:
             comments = [dict(r) for r in self.con.execute(
-                "SELECT id, ticket_id, author_id, public, created_at, body "
-                "FROM comments WHERE ticket_id=? ORDER BY created_ts, id",
+                "SELECT c.id, c.ticket_id, c.author_id, c.public, c.created_at, c.body, "
+                "       COALESCE(u.name, '')  AS author_name, "
+                "       COALESCE(u.email, '') AS author_email "
+                "FROM comments c "
+                "LEFT JOIN users u ON u.id = c.author_id "
+                "WHERE c.ticket_id=? ORDER BY c.created_ts, c.id",
                 (tid,),
             ).fetchall()]
-
-        # Resolve author names
-        for c in comments:
-            au = self.lookup_user(c["author_id"]) or {}
-            c["author_name"] = au.get("name") or ""
-            c["author_email"] = au.get("email") or ""
 
         t["comments"] = comments
         t["requester"] = self.lookup_user(t.get("requester_id"))
@@ -1443,12 +1469,15 @@ def main(argv=None) -> int:
     args = parse_args(argv)
 
     if not args.no_update and not os.environ.get("ZDWEB_UPDATED"):
-        changed = self_update(THIS_DIR)
-        if changed > 0:
-            print(f"[zdweb] updated {changed} file(s) — restarting…", flush=True)
-            env = {**os.environ, "ZDWEB_UPDATED": "1"}
-            result = subprocess.run([sys.executable, sys.argv[0], *argv], env=env)
-            return result.returncode
+        if not auto_update_enabled(THIS_DIR):
+            print(f"[zdweb] auto-update disabled via {UPDATE_TOGGLE_FILE}", flush=True)
+        else:
+            changed = self_update(THIS_DIR)
+            if changed > 0:
+                print(f"[zdweb] updated {changed} file(s) — restarting…", flush=True)
+                env = {**os.environ, "ZDWEB_UPDATED": "1"}
+                result = subprocess.run([sys.executable, sys.argv[0], *argv], env=env)
+                return result.returncode
 
     data_dir = Path(args.data_dir).expanduser().resolve()
     db_path = Path(args.db).expanduser().resolve() if args.db else None
