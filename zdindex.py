@@ -184,7 +184,12 @@ def _set_build_pragmas(con: sqlite3.Connection) -> None:
 
 
 def _set_runtime_pragmas(con: sqlite3.Connection) -> None:
-    con.execute("PRAGMA journal_mode = WAL")
+    # Checkpoint and drop WAL so the resulting file has no -wal/-shm
+    # sidecars. The web UI opens this file from a different connection
+    # right after build; on macOS, a lingering -wal can cause the next
+    # open to fail with "unable to open database file".
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.execute("PRAGMA journal_mode = DELETE")
     con.execute("PRAGMA synchronous = NORMAL")
 
 

@@ -136,9 +136,13 @@ def _fts_escape(q: str) -> str:
 
 class Backend:
     def __init__(self, db_path: Path):
-        uri = f"file:{db_path}?mode=ro"
-        self.con = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        # Plain RW open (not URI mode=ro) so SQLite can manage the -shm/-wal
+        # sidecar files when the index was just written in WAL mode. A strict
+        # read-only open fails with "unable to open database file" on macOS
+        # if a -wal file is present and -shm needs to be (re)created.
+        self.con = sqlite3.connect(str(db_path), check_same_thread=False)
         self.con.row_factory = sqlite3.Row
+        self.con.execute("PRAGMA query_only = 1")
         self.con.execute("PRAGMA cache_size = -100000")
         self.con.execute("PRAGMA temp_store = MEMORY")
         self._lock = threading.Lock()
