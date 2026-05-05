@@ -22,7 +22,6 @@ import shutil
 import socket
 import socketserver
 import sqlite3
-import ssl
 import subprocess
 import sys
 import tempfile
@@ -103,29 +102,58 @@ def write_last_data_dir(install_dir: Path, data_dir: Path) -> None:
 
 # --- self-update -----------------------------------------------------------
 
-def _build_ssl_context() -> ssl.SSLContext:
-    """SSL context that also trusts the Windows ROOT cert store.
+def _download_via_windows_tls(url: str, dest: Path, timeout: int) -> bool:
+    """Download `url` to `dest` using a Windows-native TLS client.
 
-    Vanilla python.org installs on Windows ship without any CA bundle and
-    rely on the user running 'Install Certificates.command' (which fetches
-    certifi). Many users don't, which makes the default context unable to
-    verify github.com. ssl.enum_certificates is stdlib-only and reads from
-    the live Windows trust store, so this works without bundling certifi.
+    Python on Windows often can't verify GitHub's TLS chain because the
+    python.org installer ships without a CA bundle and ssl.enum_certificates
+    misses roots that Windows would otherwise auto-fetch via the CTL
+    mechanism. The fix: hand the download to a tool that uses Windows' own
+    TLS stack (schannel), which always sees the live trust store including
+    any corporate MITM roots IT has installed.
+
+    Tries curl.exe first (shipped with Windows 10 1803+), then falls back
+    to PowerShell's Invoke-WebRequest. Returns True on success.
     """
-    ctx = ssl.create_default_context()
-    if sys.platform == "win32":
+    if sys.platform != "win32":
+        return False
+
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if curl:
         try:
-            for cert, encoding, trust in ssl.enum_certificates("ROOT"):
-                if encoding != "x509_asn":
-                    continue
-                if trust is True or (isinstance(trust, set) and "1.3.6.1.5.5.7.3.1" in trust):
-                    try:
-                        ctx.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(cert))
-                    except ssl.SSLError:
-                        pass
-        except (OSError, AttributeError):
+            r = subprocess.run(
+                [curl, "-fsSL", "--ssl-revoke-best-effort",
+                 "--max-time", str(timeout),
+                 "-A", "zdweb-updater",
+                 "-o", str(dest), url],
+                capture_output=True, timeout=timeout + 5,
+            )
+            if r.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+                return True
+        except (OSError, subprocess.TimeoutExpired):
             pass
-    return ctx
+
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if powershell:
+        try:
+            script = (
+                "$ProgressPreference='SilentlyContinue';"
+                "[Net.ServicePointManager]::SecurityProtocol="
+                "[Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13;"
+                f"Invoke-WebRequest -UseBasicParsing -Uri '{url}' "
+                f"-OutFile '{dest}' -UserAgent 'zdweb-updater' "
+                f"-TimeoutSec {timeout}"
+            )
+            r = subprocess.run(
+                [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, timeout=timeout + 5,
+            )
+            if r.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    return False
 
 
 def self_update(install_dir: Path) -> int:
@@ -141,11 +169,11 @@ def self_update(install_dir: Path) -> int:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             zip_path = tmp_path / "update.zip"
-            req = urllib.request.Request(zip_url, headers={"User-Agent": "zdweb-updater"})
-            with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT_SECONDS,
-                                        context=_build_ssl_context()) as resp:
-                with open(zip_path, "wb") as f:
-                    shutil.copyfileobj(resp, f)
+            if not _download_via_windows_tls(zip_url, zip_path, UPDATE_TIMEOUT_SECONDS):
+                req = urllib.request.Request(zip_url, headers={"User-Agent": "zdweb-updater"})
+                with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT_SECONDS) as resp:
+                    with open(zip_path, "wb") as f:
+                        shutil.copyfileobj(resp, f)
 
             extract_root = tmp_path / "extract"
             extract_root.mkdir()
@@ -175,26 +203,7 @@ def self_update(install_dir: Path) -> int:
                 changed += 1
             return changed
     except (urllib.error.URLError, socket.timeout, OSError, zipfile.BadZipFile) as e:
-        msg = str(e)
-        if "CERTIFICATE_VERIFY_FAILED" in msg or "SSL" in msg:
-            disabled = install_dir / AUTO_UPDATE_DISABLED_FILE
-            try:
-                disabled.write_text(
-                    "# Auto-created after a TLS verification failure during the update check.\n"
-                    "# This is common on managed Windows machines (corporate SSL inspection,\n"
-                    "# antivirus, missing root certs). Delete this file to re-enable updates.\n",
-                    encoding="utf-8",
-                )
-                print(f"[zdweb] update check failed (TLS verification). "
-                      f"Auto-update has been disabled — delete {AUTO_UPDATE_DISABLED_FILE} "
-                      f"to retry on the next run.",
-                      flush=True)
-            except OSError:
-                print(f"[zdweb] skipping update check (TLS verification failed). "
-                      f"Create {AUTO_UPDATE_DISABLED_FILE} next to the script to silence this.",
-                      flush=True)
-        else:
-            print(f"[zdweb] update check failed (continuing with local version): {e}", flush=True)
+        print(f"[zdweb] update check failed (continuing with local version): {e}", flush=True)
         return 0
 
 
