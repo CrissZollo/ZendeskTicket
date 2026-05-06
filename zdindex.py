@@ -30,7 +30,9 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator, Optional
+
+ProgressSink = Optional[Callable[..., None]]
 
 SCHEMA_VERSION = "1"
 DEFAULT_DATA = Path(__file__).resolve().parent / "data"
@@ -85,8 +87,21 @@ def _file_fingerprints(data_dir: Path) -> dict[str, float]:
     return out
 
 
-def emit(progress: bool, **kv) -> None:
+def emit(progress, **kv) -> None:
+    """Emit a progress event.
+
+    `progress` may be:
+      - falsy: no-op
+      - True: print `key=value` lines to stdout (CLI --progress contract)
+      - callable: invoked with the kwargs (web sink)
+    """
     if not progress:
+        return
+    if callable(progress):
+        try:
+            progress(**kv)
+        except Exception:
+            pass
         return
     parts = [f"{k}={v}" for k, v in kv.items()]
     print(" ".join(parts), flush=True)
@@ -195,7 +210,7 @@ def _set_runtime_pragmas(con: sqlite3.Connection) -> None:
 
 # --- ingest -----------------------------------------------------------------
 
-def ingest_users(con: sqlite3.Connection, path: Path, progress: bool) -> int:
+def ingest_users(con: sqlite3.Connection, path: Path, progress) -> int:
     rows = []
     n = 0
     for u in _iter_ndjson(path):
@@ -225,7 +240,7 @@ def ingest_users(con: sqlite3.Connection, path: Path, progress: bool) -> int:
     return n
 
 
-def ingest_orgs(con: sqlite3.Connection, path: Path, progress: bool) -> int:
+def ingest_orgs(con: sqlite3.Connection, path: Path, progress) -> int:
     rows = []
     n = 0
     for o in _iter_ndjson(path):
@@ -244,7 +259,7 @@ def ingest_orgs(con: sqlite3.Connection, path: Path, progress: bool) -> int:
     return n
 
 
-def ingest_groups(con: sqlite3.Connection, path: Path, progress: bool) -> int:
+def ingest_groups(con: sqlite3.Connection, path: Path, progress) -> int:
     if not path.exists():
         emit(progress, phase="groups", count=0)
         return 0
@@ -264,10 +279,13 @@ def ingest_groups(con: sqlite3.Connection, path: Path, progress: bool) -> int:
     return len(rows)
 
 
-def ingest_tickets(con: sqlite3.Connection, path: Path, progress: bool) -> int:
+def ingest_tickets(con: sqlite3.Connection, path: Path, progress) -> int:
     """Stream tickets.ndjson into tickets + ticket_tags + tickets_fts."""
     total_est = _count_lines(path)
+    emit(progress, phase="tickets", count=0, total=total_est)
     n = 0
+    last_emit_n = 0
+    last_emit_t = time.monotonic()
     rows: list[tuple] = []
     fts_rows: list[tuple] = []
     tag_rows: list[tuple] = []
@@ -345,7 +363,16 @@ def ingest_tickets(con: sqlite3.Connection, path: Path, progress: bool) -> int:
         if len(rows) >= BATCH:
             flush()
             n += BATCH
-            emit(progress, phase="tickets", count=n, total=total_est)
+
+        # Decouple emit cadence from flush cadence: emit ~every 500 records
+        # or every ~200ms, whichever comes first. Counts include rows that
+        # are still in the pending batch (n + len(rows)).
+        pending = n + len(rows)
+        now = time.monotonic()
+        if pending - last_emit_n >= 500 or (now - last_emit_t) >= 0.2:
+            emit(progress, phase="tickets", count=pending, total=total_est)
+            last_emit_n = pending
+            last_emit_t = now
 
     if rows:
         m = len(rows)
@@ -383,7 +410,7 @@ def _iter_comment_records(data_dir: Path) -> Iterator[tuple[int, list[dict]]]:
         yield tid, list(d.get("comments") or [])
 
 
-def ingest_comments(con: sqlite3.Connection, data_dir: Path, progress: bool) -> int:
+def ingest_comments(con: sqlite3.Connection, data_dir: Path, progress) -> int:
     INS_C = (
         "INSERT OR REPLACE INTO comments "
         "(id, ticket_id, author_id, public, created_at, created_ts, body) "
@@ -405,6 +432,10 @@ def ingest_comments(con: sqlite3.Connection, data_dir: Path, progress: bool) -> 
         total_tickets = sum(1 for _ in cdir.iterdir())
     else:
         total_tickets = 0
+
+    emit(progress, phase="comments", count=0, total=total_tickets, tickets=0)
+    last_emit_seen = 0
+    last_emit_t = time.monotonic()
 
     for tid, comments in _iter_comment_records(data_dir):
         tickets_seen += 1
@@ -430,7 +461,13 @@ def ingest_comments(con: sqlite3.Connection, data_dir: Path, progress: bool) -> 
             n += len(rows)
             rows = []
             fts_rows = []
-            emit(progress, phase="comments", count=n, total=total_tickets, tickets=tickets_seen)
+
+        now = time.monotonic()
+        if (tickets_seen - last_emit_seen) >= 50 or (now - last_emit_t) >= 0.2:
+            emit(progress, phase="comments",
+                 count=n + len(rows), total=total_tickets, tickets=tickets_seen)
+            last_emit_seen = tickets_seen
+            last_emit_t = now
 
     if rows:
         con.executemany(INS_C, rows)
@@ -443,7 +480,7 @@ def ingest_comments(con: sqlite3.Connection, data_dir: Path, progress: bool) -> 
 
 # --- main -------------------------------------------------------------------
 
-def build(data_dir: Path, db_path: Path, rebuild: bool, progress: bool) -> None:
+def build(data_dir: Path, db_path: Path, rebuild: bool, progress) -> None:
     t0 = time.time()
     emit(progress, phase="start")
 

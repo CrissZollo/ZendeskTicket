@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -499,6 +500,9 @@ class AppState:
         self.backend: Backend | None = None
         self.lock = threading.Lock()
         self.setup_in_progress = False
+        # Latest indexer progress event, or None when no build is/was running.
+        # Written by the indexer's progress sink, read by /api/setup/progress.
+        self.progress: dict | None = None
 
     def is_ready(self) -> bool:
         return self.backend is not None
@@ -539,6 +543,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _progress_payload(self) -> dict:
+        """Snapshot the current build progress for /api/setup/progress."""
+        with self.state.lock:
+            in_progress = self.state.setup_in_progress
+            ev = dict(self.state.progress) if self.state.progress is not None else None
+        if ev is None:
+            return {"in_progress": in_progress, "phase": "idle"}
+        ev["in_progress"] = in_progress
+        return ev
 
     def _fs_list(self, params: dict):
         """List subdirectories of a folder, for the web folder picker."""
@@ -612,6 +626,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "data_dir": str(self.state.data_dir),
                         "in_progress": self.state.setup_in_progress,
                     })
+                if path == "/api/setup/progress":
+                    return self._json(200, self._progress_payload())
                 if path == "/api/fs/list":
                     return self._fs_list(params)
                 if path == "/api/fs/roots":
@@ -625,6 +641,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._html(_render_setup_html(_setup_default_path(self.state.data_dir)))
             if path == "/api/setup/status":
                 return self._json(200, {"ready": True, "data_dir": str(self.state.data_dir)})
+            if path == "/api/setup/progress":
+                return self._json(200, self._progress_payload())
             if path == "/api/fs/list":
                 return self._fs_list(params)
             if path == "/api/fs/roots":
@@ -701,13 +719,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if self.state.setup_in_progress:
                     return self._json(409, {"error": "setup already in progress"})
                 self.state.setup_in_progress = True
+                # Clear any stale "done" state from a prior build so the
+                # poller doesn't briefly flash 100% before the new build emits.
+                self.state.progress = None
 
             old_backend = self.state.backend
             try:
                 # When switching folders, derive a fresh db_path from the chosen
                 # folder unless --db was pinned at startup.
                 db_path = (picked / "zdsearch.sqlite")
-                _build_index_if_missing(picked, db_path)
+                _build_index_if_missing(picked, db_path, self.state)
                 backend = Backend(db_path)
                 self.state.data_dir = picked
                 self.state.db_path = db_path
@@ -721,9 +742,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 print(f"[zdweb] setup complete — using {picked}", flush=True)
                 return self._json(200, {"ok": True, "data_dir": str(picked)})
             except Exception as e:
+                with self.state.lock:
+                    self.state.progress = {
+                        "phase": "error",
+                        "label": _PHASE_LABELS["error"],
+                        "message": str(e),
+                        "updated_at": time.time(),
+                    }
                 return self._json(500, {"error": f"failed to build index: {e}"})
             finally:
-                self.state.setup_in_progress = False
+                with self.state.lock:
+                    self.state.setup_in_progress = False
         except BrokenPipeError:
             pass
         except Exception as e:
@@ -827,6 +856,86 @@ _SETUP_HTML = r"""<!doctype html>
     font: inherit; border: 1px solid var(--border); border-radius: 6px;
     background: Field; color: FieldText; margin-top:.4rem;
   }
+  /* Build progress UI */
+  #progress-wrap { display: none; margin-top: 1rem; padding: .9rem 1rem;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: rgba(127,127,127,.06); }
+  #progress-wrap.active { display: block; }
+  .prog-label { font-weight: 600; margin-bottom: .35rem; }
+  .prog-counts { color: var(--sub); font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: .3rem; }
+  .prog-bar { position: relative; height: 10px; border-radius: 999px;
+    background: rgba(127,127,127,.18); overflow: hidden; }
+  .prog-bar > .fill { position: absolute; inset: 0; width: 0%;
+    background: var(--accent); border-radius: inherit;
+    transition: width .25s ease-out; }
+  .prog-bar.indeterminate > .fill {
+    width: 35%; animation: prog-slide 1.2s ease-in-out infinite;
+  }
+  @keyframes prog-slide {
+    0%   { transform: translateX(-100%); }
+    50%  { transform: translateX(180%); }
+    100% { transform: translateX(-100%); }
+  }
+  /* Stepper: dot + label per phase, connected by a line that fills as
+     each step completes. */
+  .prog-steps { display: flex; align-items: flex-start; justify-content: space-between;
+    margin: 1.1rem 0 .25rem; position: relative; gap: 0; }
+  .prog-steps .step { flex: 1 1 0; min-width: 0; position: relative;
+    display: flex; flex-direction: column; align-items: center; gap: .35rem;
+    color: var(--sub); }
+  /* Connector line from this dot's right edge to the next dot's left edge.
+     Stops short of the 18px dot so the dot stays visually crisp without
+     needing an opaque fill that fights the panel background. */
+  .prog-steps .step::before {
+    content: ""; position: absolute; top: 8px; height: 2px;
+    left: calc(50% + 13px); width: calc(100% - 26px);
+    background: rgba(127,127,127,.28); border-radius: 99px;
+    transition: background-color .25s ease-out;
+  }
+  .prog-steps .step:last-child::before { display: none; }
+  .prog-steps .step.done::before { background: #22c55e; }
+  .prog-steps .step.active::before {
+    background: linear-gradient(to right, #22c55e 0%, rgba(127,127,127,.28) 60%);
+  }
+  .prog-steps .dot {
+    position: relative; z-index: 1;
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid rgba(127,127,127,.45); box-sizing: border-box;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; line-height: 1; font-weight: 700;
+    transition: border-color .2s ease-out, background-color .2s ease-out, color .2s ease-out;
+  }
+  .prog-steps .dot .num { font-size: 10px; }
+  .prog-steps .dot .check { display: none; }
+  .prog-steps .step.active .dot {
+    border-color: var(--accent); background: var(--accent); color: #fff;
+    animation: prog-pulse 1.6s ease-out infinite;
+  }
+  .prog-steps .step.done .dot {
+    border-color: #22c55e; background: #22c55e; color: #fff;
+  }
+  .prog-steps .step.done .dot .num { display: none; }
+  .prog-steps .step.done .dot .check { display: inline; }
+  .prog-steps .step-label {
+    font-size: 11px; line-height: 1.2; max-width: 100%;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    text-align: center;
+  }
+  .prog-steps .step.active .step-label { color: var(--accent); font-weight: 600; }
+  .prog-steps .step.done .step-label { color: #15803d; }
+  @keyframes prog-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(37,99,235,.55); }
+    70%  { box-shadow: 0 0 0 8px rgba(37,99,235,0); }
+    100% { box-shadow: 0 0 0 0 rgba(37,99,235,0); }
+  }
+  @media (prefers-color-scheme: dark) {
+    .prog-steps .step.done .step-label { color: #4ade80; }
+  }
+  @media (max-width: 560px) {
+    .prog-steps .step-label { display: none; }
+    .prog-steps .step.active .step-label { display: block; }
+  }
 </style>
 </head>
 <body>
@@ -850,6 +959,13 @@ _SETUP_HTML = r"""<!doctype html>
   <p class="note">Press Enter to jump to that folder.</p>
 </div>
 <div id="msg" class="err"></div>
+
+<div id="progress-wrap" aria-live="polite">
+  <div class="prog-label" id="prog-label">Starting…</div>
+  <div class="prog-bar indeterminate" id="prog-bar"><div class="fill"></div></div>
+  <div class="prog-counts" id="prog-counts"></div>
+  <div class="prog-steps" id="prog-steps"></div>
+</div>
 
 <details>
   <summary>What files am I looking for?</summary>
@@ -958,11 +1074,125 @@ _SETUP_HTML = r"""<!doctype html>
     } catch (_) { /* non-fatal */ }
   }
 
+  // Phases shown in the step strip (mirrors zdweb.py _PHASE_ORDER, minus 'start').
+  const PHASES = ["users", "orgs", "groups", "tickets", "comments", "optimize", "done"];
+  const PHASE_LABELS = {
+    start: "Starting…",
+    users: "Indexing users",
+    orgs: "Indexing organizations",
+    groups: "Indexing groups",
+    tickets: "Indexing tickets",
+    comments: "Indexing comments",
+    optimize: "Optimizing index",
+    up_to_date: "Already up to date",
+    done: "Done",
+    error: "Error",
+  };
+  // Short labels for the stepper — the full PHASE_LABELS are too verbose
+  // to fit seven side-by-side in the 720px setup card.
+  const STEP_LABELS = {
+    users: "Users", orgs: "Orgs", groups: "Groups",
+    tickets: "Tickets", comments: "Comments",
+    optimize: "Optimize", done: "Done",
+  };
+
+  function fmtN(n) {
+    if (typeof n !== "number") return "";
+    return n.toLocaleString();
+  }
+
+  function renderProgress(ev) {
+    if (!ev) return;
+    const wrap = $("#progress-wrap");
+    wrap.classList.add("active");
+    const phase = ev.phase || "start";
+
+    $("#prog-label").textContent = ev.label || PHASE_LABELS[phase] || phase;
+
+    const bar = $("#prog-bar");
+    const fill = bar.querySelector(".fill");
+    const hasPct = typeof ev.percent === "number";
+    if (hasPct) {
+      bar.classList.remove("indeterminate");
+      fill.style.width = ev.percent + "%";
+    } else {
+      bar.classList.add("indeterminate");
+      fill.style.width = "35%";
+    }
+
+    const counts = [];
+    if (phase === "comments" && typeof ev.total === "number" && ev.total > 0
+        && typeof ev.tickets === "number") {
+      counts.push(fmtN(ev.tickets) + " / " + fmtN(ev.total) + " tickets");
+      if (typeof ev.count === "number") {
+        counts.push(fmtN(ev.count) + " comments indexed");
+      }
+    } else if (typeof ev.count === "number" && typeof ev.total === "number" && ev.total > 0) {
+      counts.push(fmtN(ev.count) + " / " + fmtN(ev.total));
+    } else if (typeof ev.count === "number") {
+      counts.push(fmtN(ev.count));
+    }
+    if (phase === "done" && typeof ev.seconds === "number") {
+      counts.push(ev.seconds + "s");
+    }
+    $("#prog-counts").textContent = counts.join(" · ");
+
+    // Stepper
+    const steps = $("#prog-steps");
+    if (!steps.dataset.built) {
+      steps.innerHTML = PHASES.map((p, i) => `
+        <div class="step" data-phase="${p}">
+          <div class="dot" aria-hidden="true">
+            <span class="num">${i + 1}</span><span class="check">✓</span>
+          </div>
+          <div class="step-label">${STEP_LABELS[p] || p}</div>
+        </div>
+      `).join("");
+      steps.dataset.built = "1";
+    }
+    const order = PHASES.indexOf(phase);
+    steps.querySelectorAll(".step").forEach((el, i) => {
+      el.classList.remove("active", "done");
+      if (order < 0) return;
+      if (i < order) el.classList.add("done");
+      else if (i === order) el.classList.add("active");
+    });
+    if (phase === "done" || phase === "up_to_date") {
+      steps.querySelectorAll(".step").forEach(el => {
+        el.classList.remove("active");
+        el.classList.add("done");
+      });
+    }
+  }
+
   async function submit() {
     const msg = $("#msg");
     msg.className = "err"; msg.textContent = "";
     const btn = $("#go");
     btn.disabled = true; btn.textContent = "Building index…";
+    $("#progress-wrap").classList.add("active");
+    renderProgress({phase: "start", label: PHASE_LABELS.start});
+
+    let pollHandle = null;
+    let stopped = false;
+    const poll = async () => {
+      if (stopped) return;
+      try {
+        const r = await fetch("/api/setup/progress", {cache: "no-store"});
+        if (!r.ok) return;
+        const ev = await r.json();
+        if (ev && ev.phase && ev.phase !== "idle") {
+          renderProgress(ev);
+          if (ev.phase === "error" && ev.message) {
+            msg.className = "err";
+            msg.textContent = ev.message;
+          }
+        }
+      } catch (_) { /* transient */ }
+    };
+    pollHandle = setInterval(poll, 400);
+    poll();
+
     try {
       const r = await fetch("/api/setup", {
         method: "POST",
@@ -970,7 +1200,13 @@ _SETUP_HTML = r"""<!doctype html>
         body: JSON.stringify({path: cwd}),
       });
       const data = await r.json().catch(() => ({}));
+      stopped = true;
+      if (pollHandle) clearInterval(pollHandle);
+      // One last poll to sync the final state visible in the UI.
+      await poll();
+
       if (!r.ok) {
+        msg.className = "err";
         msg.textContent = data.error || ("HTTP " + r.status);
         btn.disabled = false; btn.textContent = "Use this folder";
         return;
@@ -979,6 +1215,9 @@ _SETUP_HTML = r"""<!doctype html>
       msg.textContent = "Done. Loading the search UI…";
       setTimeout(() => { window.location.href = "/"; }, 400);
     } catch (e) {
+      stopped = true;
+      if (pollHandle) clearInterval(pollHandle);
+      msg.className = "err";
       msg.textContent = "request failed: " + e;
       btn.disabled = false; btn.textContent = "Use this folder";
     }
@@ -1580,7 +1819,153 @@ def _has_export_data(data_dir: Path) -> bool:
     return False
 
 
-def _build_index_if_missing(data_dir: Path, db_path: Path) -> None:
+_PHASE_LABELS = {
+    "start": "Starting…",
+    "users": "Indexing users",
+    "orgs": "Indexing organizations",
+    "groups": "Indexing groups",
+    "tickets": "Indexing tickets",
+    "comments": "Indexing comments",
+    "optimize": "Optimizing index",
+    "up_to_date": "Already up to date",
+    "done": "Done",
+    "error": "Error",
+}
+
+# Phase order so the web UI can show overall completion across phases.
+_PHASE_ORDER = ["start", "users", "orgs", "groups", "tickets", "comments", "optimize", "done"]
+
+
+def _format_progress(ev: dict) -> str:
+    """Render an event into a one-line ASCII progress string for the terminal."""
+    phase = ev.get("phase", "?")
+    label = _PHASE_LABELS.get(phase, phase)
+    count = ev.get("count")
+    total = ev.get("total")
+    tickets = ev.get("tickets")
+    pct = ev.get("percent")
+    # For comments, the bar is driven by tickets/total; the text shows that
+    # too (count/total mixes comments-vs-tickets and is misleading).
+    if phase == "comments" and isinstance(pct, int) and isinstance(total, int) \
+            and total > 0 and isinstance(tickets, int):
+        bar_w = 24
+        filled = int(bar_w * pct / 100)
+        bar = "[" + "#" * filled + "." * (bar_w - filled) + "]"
+        return f"{bar} {pct:3d}% {label} {tickets}/{total} tickets"
+    if isinstance(total, int) and total > 0 and isinstance(count, int):
+        p = pct if isinstance(pct, int) else max(0, min(100, int(count * 100 / total)))
+        bar_w = 24
+        filled = int(bar_w * p / 100)
+        bar = "[" + "#" * filled + "." * (bar_w - filled) + "]"
+        return f"{bar} {p:3d}% {label} {count}/{total}"
+    if isinstance(count, int):
+        return f"{label} ({count})"
+    if phase == "done":
+        secs = ev.get("seconds")
+        size = ev.get("size_bytes")
+        extra = []
+        if secs is not None:
+            extra.append(f"{secs}s")
+        if isinstance(size, int):
+            extra.append(f"{size/1_048_576:.1f} MB")
+        suffix = f" — {', '.join(extra)}" if extra else ""
+        return f"{label}{suffix}"
+    if phase == "error":
+        return f"{label}: {ev.get('message', '')}"
+    return label
+
+
+class _TerminalRenderer:
+    """Print indexer progress to stdout. TTY → in-place \\r redraw; else
+    one line per phase transition only (avoids log spam in piped output)."""
+
+    def __init__(self) -> None:
+        try:
+            self._tty = bool(sys.stdout.isatty())
+        except (AttributeError, ValueError):
+            self._tty = False
+        self._last_phase: str | None = None
+        self._last_line_len = 0
+
+    def render(self, ev: dict) -> None:
+        line = _format_progress(ev)
+        phase = ev.get("phase")
+        terminal = phase in ("done", "up_to_date", "error")
+
+        if self._tty:
+            pad = max(0, self._last_line_len - len(line))
+            sys.stdout.write("\r" + line + (" " * pad))
+            self._last_line_len = len(line)
+            if terminal:
+                sys.stdout.write("\n")
+                self._last_line_len = 0
+            sys.stdout.flush()
+        else:
+            if phase != self._last_phase or terminal:
+                print(f"[zdindex] {line}", flush=True)
+                self._last_phase = phase
+
+
+def _make_progress_sink(state: "AppState | None", *, to_terminal: bool):
+    """Build an indexer progress callback.
+
+    Side-effects:
+      - If `state` is given, atomically replaces `state.progress` with a
+        snapshot dict on every event (under `state.lock`).
+      - If `to_terminal` is true, also renders to stdout (TTY-aware).
+
+    The returned callable is hot-pathed (every ~200ms during a build), so
+    keep its body cheap.
+    """
+    started_at = time.time()
+    renderer = _TerminalRenderer() if to_terminal else None
+
+    def sink(**ev) -> None:
+        phase = ev.get("phase", "")
+        count = ev.get("count")
+        total = ev.get("total")
+        tickets = ev.get("tickets")
+        percent: int | None = None
+        # For the comments phase, `total` is the ticket count and `count` is
+        # the comment count — use tickets-seen / total-tickets for the bar.
+        if phase == "comments" and isinstance(total, int) and total > 0 \
+                and isinstance(tickets, int):
+            percent = max(0, min(100, int(tickets * 100 / total)))
+        elif isinstance(total, int) and total > 0 and isinstance(count, int):
+            percent = max(0, min(100, int(count * 100 / total)))
+        elif phase in ("done", "up_to_date"):
+            percent = 100
+
+        snapshot = {
+            "phase": phase,
+            "label": _PHASE_LABELS.get(phase, phase),
+            "count": count,
+            "total": total,
+            "percent": percent,
+            "tickets": ev.get("tickets"),
+            "seconds": ev.get("seconds"),
+            "size_bytes": ev.get("size_bytes"),
+            "message": ev.get("message"),
+            "started_at": started_at,
+            "updated_at": time.time(),
+            "phase_index": _PHASE_ORDER.index(phase) if phase in _PHASE_ORDER else None,
+            "phase_total": len(_PHASE_ORDER),
+        }
+
+        if state is not None:
+            with state.lock:
+                state.progress = snapshot
+
+        if renderer is not None:
+            try:
+                renderer.render(snapshot)
+            except Exception:
+                pass
+
+    return sink
+
+
+def _build_index_if_missing(data_dir: Path, db_path: Path, state: "AppState | None" = None) -> None:
     if db_path.exists():
         return
     print("[zdweb] no index found — building one (this is a one-time step)…", flush=True)
@@ -1590,7 +1975,8 @@ def _build_index_if_missing(data_dir: Path, db_path: Path) -> None:
     # Import and call directly (faster than subprocess; same Python, same env).
     sys.path.insert(0, str(THIS_DIR))
     import zdindex  # type: ignore
-    zdindex.build(data_dir, db_path, rebuild=False, progress=False)
+    sink = _make_progress_sink(state, to_terminal=True)
+    zdindex.build(data_dir, db_path, rebuild=False, progress=sink)
 
 
 def parse_args(argv):
@@ -1644,7 +2030,7 @@ def main(argv=None) -> int:
     # user picks the folder via /setup in the browser.
     effective_db = db_path or (data_dir / "zdsearch.sqlite")
     if effective_db.exists() or _has_export_data(data_dir):
-        _build_index_if_missing(data_dir, effective_db)
+        _build_index_if_missing(data_dir, effective_db, state)
         state.backend = Backend(effective_db)
         state.db_path = effective_db
     else:
