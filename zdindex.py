@@ -34,7 +34,7 @@ from typing import Callable, Iterable, Iterator, Optional
 
 ProgressSink = Optional[Callable[..., None]]
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 DEFAULT_DATA = Path(__file__).resolve().parent / "data"
 
 
@@ -119,6 +119,16 @@ def _count_lines(path: Path) -> int:
 
 # --- schema -----------------------------------------------------------------
 
+# Tables only — no secondary indexes or FTS shadow tables. Indexes and FTS
+# are created AFTER ingestion (see INDEX_SQL and the FTS rebuild step in
+# build()) because populating an empty table and adding indexes after is
+# substantially faster than maintaining indexes during inserts.
+#
+# `tags_text` and `cf_text` on tickets are flattened search-text columns
+# referenced by external-content FTS5. They duplicate information held
+# in `tags_json` / `custom_fields_json` but let the FTS index be rebuilt
+# in bulk from the source row rather than via per-row inserts during
+# ingestion.
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 
@@ -127,8 +137,6 @@ CREATE TABLE IF NOT EXISTS users (
   name TEXT, email TEXT, role TEXT,
   organization_id INTEGER, phone TEXT, active INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-CREATE INDEX IF NOT EXISTS idx_users_org ON users(organization_id);
 
 CREATE TABLE IF NOT EXISTS organizations (
   id INTEGER PRIMARY KEY,
@@ -149,8 +157,40 @@ CREATE TABLE IF NOT EXISTS tickets (
   created_at TEXT, updated_at TEXT,
   created_ts INTEGER, updated_ts INTEGER,
   tags_json TEXT, custom_fields_json TEXT,
-  raw_json TEXT
+  tags_text TEXT, cf_text TEXT
 );
+
+CREATE TABLE IF NOT EXISTS ticket_tags (
+  ticket_id INTEGER NOT NULL,
+  tag TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS comments (
+  id INTEGER PRIMARY KEY,
+  ticket_id INTEGER, author_id INTEGER, public INTEGER,
+  created_at TEXT, created_ts INTEGER,
+  body TEXT
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS tickets_fts USING fts5(
+  subject, description, tags_text, cf_text,
+  content=tickets, content_rowid=id,
+  tokenize='unicode61 remove_diacritics 2'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
+  body,
+  content=comments, content_rowid=id,
+  tokenize='unicode61 remove_diacritics 2'
+);
+"""
+
+# Run AFTER ingestion completes. Building these on a populated table once
+# is far cheaper than maintaining them across N inserts.
+INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_org ON users(organization_id);
+
 CREATE INDEX IF NOT EXISTS idx_tickets_requester ON tickets(requester_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_assignee  ON tickets(assignee_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_org       ON tickets(organization_id);
@@ -161,32 +201,12 @@ CREATE INDEX IF NOT EXISTS idx_tickets_type      ON tickets(type);
 CREATE INDEX IF NOT EXISTS idx_tickets_updated   ON tickets(updated_ts);
 CREATE INDEX IF NOT EXISTS idx_tickets_created   ON tickets(created_ts);
 
-CREATE TABLE IF NOT EXISTS ticket_tags (
-  ticket_id INTEGER NOT NULL,
-  tag TEXT NOT NULL
-);
 CREATE INDEX IF NOT EXISTS idx_ticket_tags_tag    ON ticket_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_ticket_tags_ticket ON ticket_tags(ticket_id);
 
-CREATE TABLE IF NOT EXISTS comments (
-  id INTEGER PRIMARY KEY,
-  ticket_id INTEGER, author_id INTEGER, public INTEGER,
-  created_at TEXT, created_ts INTEGER,
-  body TEXT
-);
 CREATE INDEX IF NOT EXISTS idx_comments_ticket ON comments(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_comments_author ON comments(author_id);
 CREATE INDEX IF NOT EXISTS idx_comments_created ON comments(created_ts);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS tickets_fts USING fts5(
-  subject, description, tags, custom_fields,
-  tokenize='unicode61 remove_diacritics 2'
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
-  body,
-  tokenize='unicode61 remove_diacritics 2'
-);
 """
 
 
@@ -226,15 +246,15 @@ def ingest_users(con: sqlite3.Connection, path: Path, progress) -> int:
             u.get("phone") or "",
             1 if u.get("active", True) else 0,
         ))
-        if len(rows) >= 5000:
+        if len(rows) >= 20000:
             con.executemany(
-                "INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?,?)", rows
+                "INSERT INTO users VALUES (?,?,?,?,?,?,?)", rows
             )
             n += len(rows)
             rows.clear()
             emit(progress, phase="users", count=n)
     if rows:
-        con.executemany("INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?,?)", rows)
+        con.executemany("INSERT INTO users VALUES (?,?,?,?,?,?,?)", rows)
         n += len(rows)
     emit(progress, phase="users", count=n)
     return n
@@ -248,12 +268,12 @@ def ingest_orgs(con: sqlite3.Connection, path: Path, progress) -> int:
         if oid is None:
             continue
         rows.append((oid, o.get("name") or "", json.dumps(o.get("domain_names") or [])))
-        if len(rows) >= 5000:
-            con.executemany("INSERT OR REPLACE INTO organizations VALUES (?,?,?)", rows)
+        if len(rows) >= 20000:
+            con.executemany("INSERT INTO organizations VALUES (?,?,?)", rows)
             n += len(rows)
             rows.clear()
     if rows:
-        con.executemany("INSERT OR REPLACE INTO organizations VALUES (?,?,?)", rows)
+        con.executemany("INSERT INTO organizations VALUES (?,?,?)", rows)
         n += len(rows)
     emit(progress, phase="orgs", count=n)
     return n
@@ -274,47 +294,41 @@ def ingest_groups(con: sqlite3.Connection, path: Path, progress) -> int:
         if "id" in g
     ]
     if rows:
-        con.executemany("INSERT OR REPLACE INTO groups_ VALUES (?,?)", rows)
+        con.executemany("INSERT INTO groups_ VALUES (?,?)", rows)
     emit(progress, phase="groups", count=len(rows))
     return len(rows)
 
 
 def ingest_tickets(con: sqlite3.Connection, path: Path, progress) -> int:
-    """Stream tickets.ndjson into tickets + ticket_tags + tickets_fts."""
+    """Stream tickets.ndjson into tickets + ticket_tags. The FTS index over
+    tickets is rebuilt in bulk after ingestion (see build())."""
     total_est = _count_lines(path)
     emit(progress, phase="tickets", count=0, total=total_est)
     n = 0
     last_emit_n = 0
     last_emit_t = time.monotonic()
     rows: list[tuple] = []
-    fts_rows: list[tuple] = []
     tag_rows: list[tuple] = []
 
     INS_TICKET = (
-        "INSERT OR REPLACE INTO tickets "
+        "INSERT INTO tickets "
         "(id, subject, description, status, priority, type, "
         " requester_id, assignee_id, submitter_id, organization_id, group_id, "
         " created_at, updated_at, created_ts, updated_ts, "
-        " tags_json, custom_fields_json, raw_json) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-    )
-    INS_FTS = (
-        "INSERT INTO tickets_fts(rowid, subject, description, tags, custom_fields) "
-        "VALUES (?,?,?,?,?)"
+        " tags_json, custom_fields_json, tags_text, cf_text) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
     INS_TAG = "INSERT INTO ticket_tags(ticket_id, tag) VALUES (?,?)"
 
-    BATCH = 5000
+    BATCH = 20000
 
     def flush():
-        nonlocal rows, fts_rows, tag_rows
+        nonlocal rows, tag_rows
         if rows:
             con.executemany(INS_TICKET, rows)
-            con.executemany(INS_FTS, fts_rows)
             if tag_rows:
                 con.executemany(INS_TAG, tag_rows)
             rows = []
-            fts_rows = []
             tag_rows = []
 
     for t in _iter_ndjson(path):
@@ -354,9 +368,9 @@ def ingest_tickets(con: sqlite3.Connection, path: Path, progress) -> int:
             _parse_ts(t.get("updated_at")),
             json.dumps(tags),
             json.dumps(cf),
-            json.dumps(t, ensure_ascii=False),
+            tags_text,
+            cf_text,
         ))
-        fts_rows.append((tid, t.get("subject") or "", t.get("description") or "", tags_text, cf_text))
         for tag in tags:
             tag_rows.append((tid, str(tag).lower()))
 
@@ -411,16 +425,16 @@ def _iter_comment_records(data_dir: Path) -> Iterator[tuple[int, list[dict]]]:
 
 
 def ingest_comments(con: sqlite3.Connection, data_dir: Path, progress) -> int:
+    """Stream comments into the comments table. The FTS index over comments
+    is rebuilt in bulk after ingestion (see build())."""
     INS_C = (
-        "INSERT OR REPLACE INTO comments "
+        "INSERT INTO comments "
         "(id, ticket_id, author_id, public, created_at, created_ts, body) "
         "VALUES (?,?,?,?,?,?,?)"
     )
-    INS_FTS = "INSERT INTO comments_fts(rowid, body) VALUES (?,?)"
-    BATCH = 5000
+    BATCH = 20000
 
     rows: list[tuple] = []
-    fts_rows: list[tuple] = []
     n = 0
     tickets_seen = 0
 
@@ -453,14 +467,11 @@ def ingest_comments(con: sqlite3.Connection, data_dir: Path, progress) -> int:
                 _parse_ts(c.get("created_at")),
                 body,
             ))
-            fts_rows.append((cid, body))
 
         if len(rows) >= BATCH:
             con.executemany(INS_C, rows)
-            con.executemany(INS_FTS, fts_rows)
             n += len(rows)
             rows = []
-            fts_rows = []
 
         now = time.monotonic()
         if (tickets_seen - last_emit_seen) >= 50 or (now - last_emit_t) >= 0.2:
@@ -471,7 +482,6 @@ def ingest_comments(con: sqlite3.Connection, data_dir: Path, progress) -> int:
 
     if rows:
         con.executemany(INS_C, rows)
-        con.executemany(INS_FTS, fts_rows)
         n += len(rows)
 
     emit(progress, phase="comments", count=n, total=total_tickets, tickets=tickets_seen)
@@ -480,16 +490,48 @@ def ingest_comments(con: sqlite3.Connection, data_dir: Path, progress) -> int:
 
 # --- main -------------------------------------------------------------------
 
+def _check_schema_compat(db_path: Path) -> bool:
+    """Return True if the existing db is compatible with the current SCHEMA_VERSION.
+    Returns False (so the caller can scrap and recreate) if the file is missing,
+    unreadable, or built against an older SCHEMA_VERSION — older versions used a
+    different FTS schema that can't be migrated in place."""
+    if not db_path.exists():
+        return True
+    try:
+        con = sqlite3.connect(str(db_path))
+        try:
+            row = con.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        finally:
+            con.close()
+    except sqlite3.DatabaseError:
+        return False
+    return bool(row) and row[0] == SCHEMA_VERSION
+
+
+def _unlink_db(db_path: Path) -> None:
+    if db_path.exists():
+        db_path.unlink()
+    for ext in ("-wal", "-shm"):
+        p = db_path.with_name(db_path.name + ext)
+        if p.exists():
+            p.unlink()
+
+
 def build(data_dir: Path, db_path: Path, rebuild: bool, progress) -> None:
     t0 = time.time()
     emit(progress, phase="start")
 
-    if rebuild and db_path.exists():
-        db_path.unlink()
-        for ext in ("-wal", "-shm"):
-            p = db_path.with_name(db_path.name + ext)
-            if p.exists():
-                p.unlink()
+    if rebuild:
+        _unlink_db(db_path)
+    elif not _check_schema_compat(db_path):
+        # Existing db was built by a previous SCHEMA_VERSION — wipe and rebuild.
+        # The FTS tables changed shape between versions and CREATE VIRTUAL TABLE
+        # IF NOT EXISTS won't update them in place.
+        _unlink_db(db_path)
 
     fresh = not db_path.exists()
     con = sqlite3.connect(str(db_path))
@@ -519,14 +561,17 @@ def build(data_dir: Path, db_path: Path, rebuild: bool, progress) -> None:
                  size_bytes=db_path.stat().st_size if db_path.exists() else 0)
             return
 
-        # Wipe content tables (keep schema). FTS shadow tables are reset implicitly.
+        # Wipe content tables (keep schema). External-content FTS tables are
+        # reset via 'delete-all' which clears the FTS index without touching
+        # the source tables.
         con.execute("BEGIN")
         for tbl in (
             "users", "organizations", "groups_",
             "tickets", "ticket_tags", "comments",
-            "tickets_fts", "comments_fts",
         ):
             con.execute(f"DELETE FROM {tbl}")
+        con.execute("INSERT INTO tickets_fts(tickets_fts) VALUES('delete-all')")
+        con.execute("INSERT INTO comments_fts(comments_fts) VALUES('delete-all')")
         con.commit()
 
         con.execute("BEGIN")
@@ -536,6 +581,18 @@ def build(data_dir: Path, db_path: Path, rebuild: bool, progress) -> None:
         ingest_tickets(con, data_dir / "tickets.ndjson", progress)
         ingest_comments(con, data_dir, progress)
         con.commit()
+
+        # Bulk-build the FTS index from the populated source tables. This is
+        # several times faster than per-row FTS inserts during ingestion
+        # because FTS5 can lay out segments in one pass.
+        emit(progress, phase="fts")
+        con.execute("INSERT INTO tickets_fts(tickets_fts) VALUES('rebuild')")
+        con.execute("INSERT INTO comments_fts(comments_fts) VALUES('rebuild')")
+
+        # Create secondary indexes on populated tables. Building once on a
+        # full table is far cheaper than maintaining indexes during inserts.
+        emit(progress, phase="indexes")
+        con.executescript(INDEX_SQL)
 
         emit(progress, phase="optimize")
         con.execute("INSERT INTO tickets_fts(tickets_fts) VALUES('optimize')")

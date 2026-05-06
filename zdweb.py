@@ -424,7 +424,7 @@ class Backend:
             t["custom_fields"] = json.loads(t.get("custom_fields_json") or "[]")
         except json.JSONDecodeError:
             t["custom_fields"] = []
-        for k in ("tags_json", "custom_fields_json", "raw_json"):
+        for k in ("tags_json", "custom_fields_json", "tags_text", "cf_text"):
             t.pop(k, None)
 
         with self._lock:
@@ -1075,7 +1075,8 @@ _SETUP_HTML = r"""<!doctype html>
   }
 
   // Phases shown in the step strip (mirrors zdweb.py _PHASE_ORDER, minus 'start').
-  const PHASES = ["users", "orgs", "groups", "tickets", "comments", "optimize", "done"];
+  const PHASES = ["users", "orgs", "groups", "tickets", "comments",
+                  "fts", "indexes", "optimize", "done"];
   const PHASE_LABELS = {
     start: "Starting…",
     users: "Indexing users",
@@ -1083,16 +1084,19 @@ _SETUP_HTML = r"""<!doctype html>
     groups: "Indexing groups",
     tickets: "Indexing tickets",
     comments: "Indexing comments",
-    optimize: "Optimizing index",
+    fts: "Building search index",
+    indexes: "Creating indexes",
+    optimize: "Optimizing",
     up_to_date: "Already up to date",
     done: "Done",
     error: "Error",
   };
   // Short labels for the stepper — the full PHASE_LABELS are too verbose
-  // to fit seven side-by-side in the 720px setup card.
+  // to fit nine side-by-side in the 720px setup card.
   const STEP_LABELS = {
     users: "Users", orgs: "Orgs", groups: "Groups",
     tickets: "Tickets", comments: "Comments",
+    fts: "Search", indexes: "Indexes",
     optimize: "Optimize", done: "Done",
   };
 
@@ -1826,14 +1830,17 @@ _PHASE_LABELS = {
     "groups": "Indexing groups",
     "tickets": "Indexing tickets",
     "comments": "Indexing comments",
-    "optimize": "Optimizing index",
+    "fts": "Building search index",
+    "indexes": "Creating indexes",
+    "optimize": "Optimizing",
     "up_to_date": "Already up to date",
     "done": "Done",
     "error": "Error",
 }
 
 # Phase order so the web UI can show overall completion across phases.
-_PHASE_ORDER = ["start", "users", "orgs", "groups", "tickets", "comments", "optimize", "done"]
+_PHASE_ORDER = ["start", "users", "orgs", "groups", "tickets", "comments",
+                "fts", "indexes", "optimize", "done"]
 
 
 def _format_progress(ev: dict) -> str:
