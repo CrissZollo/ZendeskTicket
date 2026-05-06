@@ -221,3 +221,7 @@ __marimo__/
 
 auto_update_disabled.txt
 last-data-dir.txt
+/data/
+
+# Portable Python provisioned by Run on Windows.bat on machines without Python.
+/python/

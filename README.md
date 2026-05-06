@@ -8,6 +8,7 @@ data leaves your computer.
 ## Requirements
 
 - **Python 3.10 or newer** on the machine you'll run it from.
+  - On **Windows**, the launcher takes care of this for you — see below.
 - Your Zendesk export files (NDJSON) — see [`data/README.txt`](data/README.txt)
   for the expected filenames.
 
@@ -17,9 +18,13 @@ alone — no `pip install` step.
 ## Install Python
 
 ### Windows
-1. Go to <https://www.python.org/downloads/> and download the latest installer.
-2. Run it. **Tick "Add Python to PATH"** at the bottom of the first screen,
-   then click "Install Now".
+Nothing to do. Just double-click `Run on Windows.bat`. If Python isn't already
+installed, the launcher will download a portable Python (~10 MB) into a
+`python\` folder next to the script on first run and use that. No admin
+required, no PATH changes, no Microsoft Store prompt.
+
+If you'd rather install Python yourself, that still works — the launcher will
+prefer any system Python it finds.
 
 ### Mac
 Either:
@@ -66,8 +71,11 @@ After that, normal double-clicking works.
 
 ## Troubleshooting
 
-- **"Python is not recognized" / not found** — Python isn't installed, or wasn't
-  added to PATH on Windows. Reinstall and tick "Add Python to PATH".
+- **"Python is not recognized" / not found** — Python isn't installed. On
+  Windows, `Run on Windows.bat` will download a portable Python automatically;
+  if that step fails (e.g. no internet on first run), install Python manually
+  from <https://www.python.org/downloads/> and tick "Add Python to PATH". On
+  Mac/Linux, install via the steps in [Install Python](#install-python).
 - **"data directory not found"** — make sure your `*.ndjson` files are inside
   the `data/` folder next to the launcher script.
 - **Port 8765 already in use** — another copy is already running, or another
